@@ -1,220 +1,1054 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+# =============================================================
+# DiseaseDetectPro VisionAgent — Complete Google Colab Prototype
+# OpenCV Perception → Agent Decision → EfficientNet-CBAM
+# → Grad-CAM++ → Diagnosis / New Image / Human Review
+# =============================================================
 
-# C extensions
-*.so
+# -------------------------------------------------------------
+# 1. INSTALL DEPENDENCIES
+# -------------------------------------------------------------
+!pip -q install timm grad-cam gradio boto3 scikit-learn matplotlib opencv-python-headless
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+import os
+import io
+import json
+import time
+import uuid
+import traceback
+import numpy as np
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+import gradio as gr
+import matplotlib.pyplot as plt
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+from PIL import Image
+from torchvision import transforms, datasets
+from torch.utils.data import DataLoader, random_split
+from pytorch_grad_cam import GradCAMPlusPlus
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-*.lcov
-.hypothesis/
-.pytest_cache/
-cover/
+print("=" * 70)
+print("DiseaseDetectPro VisionAgent")
+print("=" * 70)
+print(f"Device: {device}")
+print(f"OpenCV version: {cv2.__version__}")
+print(f"PyTorch version: {torch.__version__}")
+print("=" * 70)
 
-# Translations
-*.mo
-*.pot
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# -------------------------------------------------------------
+# 2. CONFIGURATION
+# -------------------------------------------------------------
+CONFIG = {
+    "image_size": 224,
+    "model_name": "efficientnet_b0",
+    "confidence_threshold": 0.60,
+    "review_threshold": 0.45,
+    "min_leaf_ratio": 0.03,
+    "max_blur_score": 120.0,
+    "min_brightness": 45,
+    "max_brightness": 235,
+    "min_saturation": 18,
+    "max_aspect_ratio": 4.0,
+}
 
-# Flask stuff:
-instance/
-.webassets-cache
+# Replace these with your real crop-disease classes after training.
+CLASS_NAMES = [
+    "Healthy",
+    "Bacterial_leaf_blight",
+    "Brown_spot",
+    "Leaf_smut",
+    "Tomato_Late_blight",
+    "Tomato_Early_blight",
+]
 
-# Scrapy stuff:
-.scrapy
+NUM_CLASSES = len(CLASS_NAMES)
 
-# Sphinx documentation
-docs/_build/
+DATASET_DIR = "/content/dataset"
+MODEL_SAVE_PATH = "/content/diseasedetectpro_efficientnet_cbam.pth"
 
-# PyBuilder
-.pybuilder/
-target/
+TRAIN_MODEL = False  # Set True after placing your dataset in /content/dataset
 
-# Jupyter Notebook
-.ipynb_checkpoints
 
-# IPython
-profile_default/
-ipython_config.py
+# -------------------------------------------------------------
+# 3. EFFICIENTNET-CBAM MODEL
+# -------------------------------------------------------------
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, max(1, channels // reduction), 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(1, channels // reduction), channels, 1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    def forward(self, x):
+        avg_out = self.mlp(self.avg_pool(x))
+        max_out = self.mlp(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out)
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
 
-# uv
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            2, 1, kernel_size,
+            padding=kernel_size // 2,
+            bias=False
+        )
+        self.sigmoid = nn.Sigmoid()
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+    def forward(self, x):
+        avg_map = torch.mean(x, dim=1, keepdim=True)
+        max_map, _ = torch.max(x, dim=1, keepdim=True)
+        attention_input = torch.cat([avg_map, max_map], dim=1)
+        return self.sigmoid(self.conv(attention_input))
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi/*
-!.pixi/config.toml
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.channel_attention = ChannelAttention(channels, reduction)
+        self.spatial_attention = SpatialAttention()
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    def forward(self, x):
+        x = x * self.channel_attention(x)
+        x = x * self.spatial_attention(x)
+        return x
 
-# Celery stuff
-celerybeat-schedule*
-celerybeat.pid
 
-# Redis
-*.rdb
-*.aof
-*.pid
+class EfficientNetCBAM(nn.Module):
+    def __init__(self, num_classes, model_name="efficientnet_b0", pretrained=True):
+        super().__init__()
 
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool=""
+        )
 
-# ActiveMQ
-activemq-data/
+        self.feature_dim = self.backbone.num_features
+        self.cbam = CBAM(self.feature_dim)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.2)
+        self.classifier = nn.Linear(self.feature_dim, num_classes)
 
-# SageMath parsed files
-*.sage.py
+    def forward(self, x):
+        features = self.backbone.forward_features(x)
+        features = self.cbam(features)
+        pooled = self.pool(features).flatten(1)
+        logits = self.classifier(self.dropout(pooled))
+        return logits
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
 
-# Spyder project settings
-.spyderproject
-.spyproject
+print("\nLoading EfficientNet-CBAM model...")
 
-# Rope project settings
-.ropeproject
+model = EfficientNetCBAM(
+    num_classes=NUM_CLASSES,
+    model_name=CONFIG["model_name"],
+    pretrained=True
+).to(device)
 
-# mkdocs/Zensical documentation
-/site
+print("Model loaded successfully.")
+print(f"Number of classes: {NUM_CLASSES}")
+print(f"Feature dimension: {model.feature_dim}")
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
 
-# Pyre type checker
-.pyre/
+# -------------------------------------------------------------
+# 4. OPTIONAL TRAINING ON YOUR OWN DATASET
+# -------------------------------------------------------------
+# Expected dataset structure:
+# /content/dataset/
+#     Healthy/
+#     Bacterial_leaf_blight/
+#     Brown_spot/
+#     Leaf_smut/
+#     Tomato_Late_blight/
+#     Tomato_Early_blight/
 
-# pytype static type analyzer
-.pytype/
+if TRAIN_MODEL:
+    print("\nStarting training...")
 
-# Cython debug symbols
-cython_debug/
+    train_transform = transforms.Compose([
+        transforms.Resize((CONFIG["image_size"], CONFIG["image_size"])),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(20),
+        transforms.ColorJitter(
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.15,
+            hue=0.05
+        ),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
+    ])
 
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
+    full_dataset = datasets.ImageFolder(DATASET_DIR, transform=train_transform)
 
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
+    CLASS_NAMES = full_dataset.classes
+    NUM_CLASSES = len(CLASS_NAMES)
 
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore that
-#   can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, you
-#   could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
+    print("Detected classes:", CLASS_NAMES)
+    print("Total images:", len(full_dataset))
 
-# Ruff stuff:
-.ruff_cache/
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
 
-# PyPI configuration file
-.pypirc
+    train_dataset, val_dataset = random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
 
-# Streamlit
-.streamlit/secrets.toml
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=32,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=3e-4,
+        weight_decay=1e-4
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=10
+    )
+
+    EPOCHS = 10
+    best_val_accuracy = 0.0
+
+    for epoch in range(EPOCHS):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        for images, labels in train_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * images.size(0)
+            correct += (outputs.argmax(1) == labels).sum().item()
+            total += labels.size(0)
+
+        scheduler.step()
+
+        train_loss = running_loss / total
+        train_accuracy = correct / total
+
+        model.eval()
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+
+                outputs = model(images)
+                val_correct += (outputs.argmax(1) == labels).sum().item()
+                val_total += labels.size(0)
+
+        val_accuracy = val_correct / val_total
+
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Train Acc: {train_accuracy:.4f} | "
+            f"Val Acc: {val_accuracy:.4f}"
+        )
+
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            torch.save(model.state_dict(), MODEL_SAVE_PATH)
+
+    print(f"\nTraining complete. Best validation accuracy: {best_val_accuracy:.4f}")
+    print(f"Best model saved to: {MODEL_SAVE_PATH}")
+
+    model.load_state_dict(
+        torch.load(MODEL_SAVE_PATH, map_location=device)
+    )
+
+model.eval()
+
+
+# -------------------------------------------------------------
+# 5. OPENCV PERCEPTION MODULE
+# -------------------------------------------------------------
+class OpenCVPerceptionModule:
+    """
+    Performs OpenCV-based visual perception:
+    - Image quality assessment
+    - Blur, brightness, saturation, contrast analysis
+    - Leaf-region segmentation
+    - ROI extraction
+    - Denoising and contrast enhancement
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    def read_image(self, image_path):
+        image_bgr = cv2.imread(image_path)
+
+        if image_bgr is None:
+            raise ValueError("Unable to read the uploaded image.")
+
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        return image_rgb
+
+    def assess_quality(self, rgb_image):
+        gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+        hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
+
+        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        brightness = float(np.mean(gray))
+        saturation = float(np.mean(hsv[:, :, 1]))
+        contrast = float(np.std(gray))
+
+        height, width = gray.shape[:2]
+        aspect_ratio = max(height, width) / max(1, min(height, width))
+
+        issues = []
+
+        if blur_score < self.config["max_blur_score"]:
+            issues.append("Image appears blurry")
+
+        if brightness < self.config["min_brightness"]:
+            issues.append("Image is too dark")
+
+        if brightness > self.config["max_brightness"]:
+            issues.append("Image is overexposed")
+
+        if saturation < self.config["min_saturation"]:
+            issues.append("Low color information; possible poor lighting or non-leaf image")
+
+        if aspect_ratio > self.config["max_aspect_ratio"]:
+            issues.append("Unusual image aspect ratio")
+
+        quality = {
+            "blur_score": round(float(blur_score), 2),
+            "brightness": round(brightness, 2),
+            "saturation": round(saturation, 2),
+            "contrast": round(contrast, 2),
+            "resolution": [int(width), int(height)],
+            "aspect_ratio": round(float(aspect_ratio), 2),
+            "issues": issues,
+            "is_acceptable": len(issues) == 0
+        }
+
+        return quality
+
+    def segment_leaf_region(self, rgb_image):
+        hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
+
+        lower_green = np.array([25, 30, 30], dtype=np.uint8)
+        upper_green = np.array([95, 255, 255], dtype=np.uint8)
+
+        mask = cv2.inRange(hsv, lower_green, upper_green)
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        total_pixels = mask.shape[0] * mask.shape[1]
+        leaf_ratio = float(np.count_nonzero(mask)) / max(1, total_pixels)
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        roi_box = None
+
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            roi_box = [int(x), int(y), int(w), int(h)]
+
+        return mask, leaf_ratio, roi_box
+
+    def enhance_image(self, rgb_image):
+        lab = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+
+        clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8)
+        )
+
+        l_channel = clahe.apply(l_channel)
+        enhanced_lab = cv2.merge([l_channel, a_channel, b_channel])
+        enhanced_rgb = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
+
+        denoised_rgb = cv2.fastNlMeansDenoisingColored(
+            enhanced_rgb,
+            None,
+            5,
+            5,
+            7,
+            21
+        )
+
+        return denoised_rgb
+
+    def extract_roi(self, enhanced_rgb, roi_box):
+        if roi_box is None:
+            return enhanced_rgb
+
+        x, y, w, h = roi_box
+        height, width = enhanced_rgb.shape[:2]
+
+        x = max(0, x)
+        y = max(0, y)
+        w = min(w, width - x)
+        h = min(h, height - y)
+
+        if w <= 0 or h <= 0:
+            return enhanced_rgb
+
+        roi = enhanced_rgb[y:y + h, x:x + w]
+
+        if roi.size == 0:
+            return enhanced_rgb
+
+        return roi
+
+    def process(self, image_path):
+        rgb_image = self.read_image(image_path)
+
+        quality = self.assess_quality(rgb_image)
+        leaf_mask, leaf_ratio, roi_box = self.segment_leaf_region(rgb_image)
+
+        sufficient_leaf_tissue = leaf_ratio >= self.config["min_leaf_ratio"]
+
+        perception = {
+            "quality": quality,
+            "leaf_ratio": round(leaf_ratio, 4),
+            "leaf_roi": roi_box,
+            "has_sufficient_leaf_tissue": sufficient_leaf_tissue,
+            "leaf_mask": leaf_mask,
+            "original_image": rgb_image
+        }
+
+        if quality["is_acceptable"] and sufficient_leaf_tissue:
+            enhanced_image = self.enhance_image(rgb_image)
+            roi_image = self.extract_roi(enhanced_image, roi_box)
+
+            perception.update({
+                "status": "ACCEPT",
+                "processed_image": enhanced_image,
+                "roi_image": roi_image
+            })
+        else:
+            perception.update({
+                "status": "REJECT",
+                "processed_image": rgb_image.copy(),
+                "roi_image": rgb_image.copy()
+            })
+
+        return perception
+
+
+print("\nInitializing OpenCV perception module...")
+perception_module = OpenCVPerceptionModule(CONFIG)
+print("OpenCV perception module ready.")
+
+
+# -------------------------------------------------------------
+# 6. GRAD-CAM++ EXPLAINABILITY MODULE
+# -------------------------------------------------------------
+class ExplainabilityModule:
+    """
+    Generates Grad-CAM++ visual explanations for the predicted class.
+    """
+
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layers = [target_layer]
+
+    def generate(self, rgb_image, input_tensor, predicted_class_index):
+        rgb_resized = cv2.resize(
+            rgb_image,
+            (CONFIG["image_size"], CONFIG["image_size"])
+        )
+
+        rgb_float = np.float32(rgb_resized) / 255.0
+
+        with GradCAMPlusPlus(
+            model=self.model,
+            target_layers=self.target_layers
+        ) as cam_object:
+
+            grayscale_cam = cam_object(
+                input_tensor=input_tensor,
+                targets=[
+                    ClassifierOutputTarget(predicted_class_index)
+                ]
+            )
+
+        grayscale_cam = grayscale_cam[0, :]
+        cam_visualization = show_cam_on_image(
+            rgb_float,
+            grayscale_cam,
+            use_rgb=True
+        )
+
+        return cam_visualization, grayscale_cam
+
+
+def get_gradcam_target_layer(model):
+    """
+    Finds a suitable final convolutional feature layer for Grad-CAM++.
+    """
+    try:
+        return model.backbone.conv_head
+    except Exception:
+        pass
+
+    try:
+        return model.backbone.blocks[-1]
+    except Exception:
+        pass
+
+    raise ValueError(
+        "Could not identify a Grad-CAM++ target layer for this model."
+    )
+
+
+print("\nInitializing Grad-CAM++ explainability module...")
+
+gradcam_target_layer = get_gradcam_target_layer(model)
+explainability_module = ExplainabilityModule(
+    model=model,
+    target_layer=gradcam_target_layer
+)
+
+print("Grad-CAM++ module ready.")
+print(f"Target layer: {gradcam_target_layer}")
+
+
+# -------------------------------------------------------------
+# 7. VISIONAGENT — AGENTIC ORCHESTRATION LAYER
+# -------------------------------------------------------------
+class VisionAgent:
+    """
+    Agentic decision-making layer.
+
+    Workflow:
+    1. OpenCV perception
+    2. Agent evaluates image quality and leaf coverage
+    3. If acceptable, EfficientNet-CBAM performs classification
+    4. Grad-CAM++ generates explanation
+    5. Agent evaluates confidence and decides final action
+    """
+
+    def __init__(
+        self,
+        model,
+        perception_module,
+        explainability_module,
+        class_names,
+        config
+    ):
+        self.model = model
+        self.perception = perception_module
+        self.explainer = explainability_module
+        self.class_names = class_names
+        self.config = config
+
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize(
+                (config["image_size"], config["image_size"])
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+        ])
+
+        self.execution_trace = []
+
+    def reset_trace(self):
+        self.execution_trace = []
+
+    def log_step(self, step, tool, decision, details):
+        self.execution_trace.append({
+            "step": step,
+            "tool": tool,
+            "decision": decision,
+            "details": details
+        })
+
+    def classify(self, roi_image):
+        input_tensor = self.transform(roi_image).unsqueeze(0).to(device)
+
+        self.model.eval()
+
+        with torch.no_grad():
+            logits = self.model(input_tensor)
+            probabilities = F.softmax(logits, dim=1)[0]
+
+        probabilities = probabilities.cpu().numpy()
+        predicted_index = int(np.argmax(probabilities))
+
+        return {
+            "input_tensor": input_tensor,
+            "probabilities": probabilities,
+            "predicted_index": predicted_index,
+            "predicted_class": self.class_names[predicted_index],
+            "confidence": float(probabilities[predicted_index])
+        }
+
+    def run(self, image_path):
+        start_time = time.time()
+        self.reset_trace()
+
+        try:
+            perception = self.perception.process(image_path)
+        except Exception as error:
+            self.log_step(
+                1,
+                "OpenCV Perception",
+                "ERROR",
+                str(error)
+            )
+
+            return {
+                "status": "ERROR",
+                "message": "The uploaded file could not be processed as an image.",
+                "trace": self.execution_trace,
+                "latency_sec": round(time.time() - start_time, 3)
+            }
+
+        self.log_step(
+            1,
+            "OpenCV Perception",
+            perception["status"],
+            {
+                "quality": perception["quality"],
+                "leaf_ratio": perception["leaf_ratio"],
+                "leaf_roi": perception["leaf_roi"],
+                "sufficient_leaf_tissue": perception["has_sufficient_leaf_tissue"]
+            }
+        )
+
+        if perception["status"] == "REJECT":
+            reasons = perception["quality"].get("issues", [])
+
+            if not perception["has_sufficient_leaf_tissue"]:
+                reasons.append(
+                    "Insufficient visible leaf tissue detected"
+                )
+
+            return {
+                "status": "REQUEST_NEW_IMAGE",
+                "message": (
+                    "OpenCV perception found the image unsuitable. "
+                    "Please upload a clearer, well-lit close-up image "
+                    "of the affected leaf."
+                ),
+                "reasons": reasons,
+                "perception": {
+                    "quality": perception["quality"],
+                    "leaf_ratio": perception["leaf_ratio"],
+                    "leaf_roi": perception["leaf_roi"]
+                },
+                "processed_image": perception["processed_image"],
+                "roi_image": perception["roi_image"],
+                "leaf_mask": perception["leaf_mask"],
+                "trace": self.execution_trace,
+                "latency_sec": round(time.time() - start_time, 3)
+            }
+
+        self.log_step(
+            2,
+            "VisionAgent",
+            "PROCEED_TO_CLASSIFICATION",
+            "Image passed OpenCV quality and leaf-coverage checks."
+        )
+
+        classification = self.classify(perception["roi_image"])
+
+        self.log_step(
+            3,
+            "EfficientNet-CBAM",
+            "CLASSIFICATION_COMPLETE",
+            {
+                "predicted_class": classification["predicted_class"],
+                "confidence": classification["confidence"]
+            }
+        )
+
+        predicted_index = classification["predicted_index"]
+        confidence = classification["confidence"]
+
+        try:
+            gradcam_image, gradcam_heatmap = self.explainer.generate(
+                perception["roi_image"],
+                classification["input_tensor"],
+                predicted_index
+            )
+
+            self.log_step(
+                4,
+                "Grad-CAM++",
+                "EXPLANATION_GENERATED",
+                "Visual explanation generated for the predicted class."
+            )
+
+        except Exception as error:
+            gradcam_image = perception["roi_image"].copy()
+            gradcam_heatmap = np.zeros(
+                (CONFIG["image_size"], CONFIG["image_size"]),
+                dtype=np.float32
+            )
+
+            self.log_step(
+                4,
+                "Grad-CAM++",
+                "EXPLANATION_FAILED",
+                str(error)
+            )
+
+        if confidence >= self.config["confidence_threshold"]:
+            action = "RETURN_DIAGNOSIS"
+
+            message = (
+                f"Probable condition: {classification['predicted_class']} "
+                f"with confidence {confidence:.2%}. "
+                "This is an AI screening result and should be confirmed "
+                "by an agricultural expert when possible."
+            )
+
+        elif confidence >= self.config["review_threshold"]:
+            action = "HUMAN_REVIEW"
+
+            message = (
+                f"The model suggests {classification['predicted_class']} "
+                f"with moderate confidence ({confidence:.2%}). "
+                "Please request review by an agricultural expert."
+            )
+
+        else:
+            action = "REQUEST_ADDITIONAL_EVIDENCE"
+
+            message = (
+                "The model is not confident enough to provide a reliable "
+                "diagnosis. Please upload another close-up image of the "
+                "affected leaf under good lighting."
+            )
+
+        self.log_step(
+            5,
+            "VisionAgent",
+            action,
+            message
+        )
+
+        return {
+            "status": action,
+            "message": message,
+            "predicted_class": classification["predicted_class"],
+            "confidence": confidence,
+            "class_probabilities": {
+                self.class_names[i]: round(float(probability), 4)
+                for i, probability in enumerate(classification["probabilities"])
+            },
+            "gradcam_image": gradcam_image,
+            "gradcam_heatmap": gradcam_heatmap,
+            "processed_image": perception["processed_image"],
+            "roi_image": perception["roi_image"],
+            "leaf_mask": perception["leaf_mask"],
+            "perception": {
+                "quality": perception["quality"],
+                "leaf_ratio": perception["leaf_ratio"],
+                "leaf_roi": perception["leaf_roi"]
+            },
+            "trace": self.execution_trace,
+            "latency_sec": round(time.time() - start_time, 3)
+        }
+
+
+print("\nInitializing VisionAgent...")
+vision_agent = VisionAgent(
+    model=model,
+    perception_module=perception_module,
+    explainability_module=explainability_module,
+    class_names=CLASS_NAMES,
+    config=CONFIG
+)
+print("VisionAgent ready.")
+
+
+# -------------------------------------------------------------
+# 8. OPTIONAL AWS S3 ARTIFACT STORAGE
+# -------------------------------------------------------------
+USE_AWS = False  # Set True only after configuring AWS credentials securely
+
+AWS_BUCKET_NAME = "your-diseasedetectpro-bucket"
+AWS_REGION = "us-east-1"
+
+if USE_AWS:
+    import boto3
+    from botocore.exceptions import NoCredentialsError
+
+    s3_client = boto3.client("s3", region_name=AWS_REGION)
+
+    def upload_file_to_s3(local_path, s3_key):
+        try:
+            s3_client.upload_file(
+                local_path,
+                AWS_BUCKET_NAME,
+                s3_key
+            )
+            return f"s3://{AWS_BUCKET_NAME}/{s3_key}"
+        except NoCredentialsError:
+            return "AWS credentials not configured."
+        except Exception as error:
+            return f"AWS upload failed: {error}"
+
+    def save_and_upload_agent_artifacts(result, request_id=None):
+        request_id = request_id or str(uuid.uuid4())
+        output_dir = "/content/aws_outputs"
+        os.makedirs(output_dir, exist_ok=True)
+
+        gradcam_path = os.path.join(
+            output_dir,
+            f"{request_id}_gradcam.jpg"
+        )
+
+        trace_path = os.path.join(
+            output_dir,
+            f"{request_id}_agent_trace.json"
+        )
+
+        if "gradcam_image" in result:
+            Image.fromarray(result["gradcam_image"]).save(gradcam_path)
+
+        with open(trace_path, "w") as file:
+            json.dump(
+                result.get("trace", []),
+                file,
+                indent=2,
+                default=str
+            )
+
+        return {
+            "request_id": request_id,
+            "gradcam_s3_uri": upload_file_to_s3(
+                gradcam_path,
+                f"gradcam/{request_id}.jpg"
+            ),
+            "trace_s3_uri": upload_file_to_s3(
+                trace_path,
+                f"agent_traces/{request_id}.json"
+            )
+        }
+
+    print("AWS S3 artifact-upload utilities enabled.")
+else:
+    print("AWS S3 integration disabled. Set USE_AWS=True after secure configuration.")
+
+
+# -------------------------------------------------------------
+# 9. GRADIO JUDGE-FACING WEB APPLICATION
+# -------------------------------------------------------------
+def analyze_crop_image(input_image):
+    if input_image is None:
+        return (
+            "Please upload a crop-leaf image.",
+            None,
+            None,
+            None
+        )
+
+    request_id = str(uuid.uuid4())
+    temp_image_path = f"/content/{request_id}.jpg"
+
+    image_bgr = cv2.cvtColor(
+        np.array(input_image),
+        cv2.COLOR_RGB2BGR
+    )
+
+    cv2.imwrite(temp_image_path, image_bgr)
+
+    try:
+        result = vision_agent.run(temp_image_path)
+    except Exception as error:
+        return (
+            f"### System error\n\n```text\n{traceback.format_exc()}\n```",
+            None,
+            None,
+            None
+        )
+
+    trace_text = "\n".join([
+        f"**Step {event['step']}:** {event['tool']} → `{event['decision']}`"
+        for event in result.get("trace", [])
+    ])
+
+    if result["status"] in ["ERROR", "REQUEST_NEW_IMAGE"]:
+        reasons = result.get("reasons", [])
+
+        reason_text = ""
+        if reasons:
+            reason_text = "\n".join([
+                f"- {reason}" for reason in reasons
+            ])
+
+        output = (
+            f"### {result['status'].replace('_', ' ')}\n\n"
+            f"{result['message']}\n\n"
+        )
+
+        if reason_text:
+            output += f"**Detected issues**\n\n{reason_text}\n\n"
+
+        output += (
+            f"**OpenCV leaf coverage:** "
+            f"{result.get('perception', {}).get('leaf_ratio', 0):.2%}\n\n"
+            f"**Agent execution trace**\n\n{trace_text}\n\n"
+            f"**Processing latency:** {result['latency_sec']} seconds"
+        )
+
+        return (
+            output,
+            result.get("processed_image"),
+            result.get("roi_image"),
+            result.get("leaf_mask")
+        )
+
+    sorted_probabilities = sorted(
+        result["class_probabilities"].items(),
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    probability_text = "\n".join([
+        f"- **{class_name}**: {probability:.2%}"
+        for class_name, probability in sorted_probabilities
+    ])
+
+    output = (
+        f"### {result['status'].replace('_', ' ')}\n\n"
+        f"{result['message']}\n\n"
+        f"**Predicted class:** `{result['predicted_class']}`\n\n"
+        f"**Confidence:** {result['confidence']:.2%}\n\n"
+        f"**Class probabilities**\n\n{probability_text}\n\n"
+        f"**OpenCV leaf coverage:** "
+        f"{result['perception']['leaf_ratio']:.2%}\n\n"
+        f"**OpenCV quality assessment**\n\n"
+        f"```json\n"
+        f"{json.dumps(result['perception']['quality'], indent=2)}\n"
+        f"```\n\n"
+        f"**Agent execution trace**\n\n{trace_text}\n\n"
+        f"**Processing latency:** {result['latency_sec']} seconds"
+    )
+
+    return (
+        output,
+        result["processed_image"],
+        result["roi_image"],
+        result["gradcam_image"]
+    )
+
+
+with gr.Blocks(
+    title="DiseaseDetectPro VisionAgent"
+) as demo:
+
+    gr.Markdown(
+        """
+        # 🌿 DiseaseDetectPro VisionAgent
+
+        ### OpenCV Perception → Agent Decision → EfficientNet-CBAM → Grad-CAM++ → Action
+
+        Upload a crop-leaf image. The VisionAgent will:
+
+        1. Assess image quality using OpenCV.
+        2. Detect and extract the leaf region.
+        3. Decide whether the image is suitable.
+        4. Classify the possible disease using EfficientNet-CBAM.
+        5. Generate a Grad-CAM++ explanation.
+        6. Return a diagnosis, request another image, or escalate for human review.
+        """
+    )
+
+    with gr.Row():
+        with gr.Column():
+            input_image = gr.Image(
+                type="pil",
+                label="Upload crop-leaf image"
+            )
+            analyze_button = gr.Button(
+                "Analyze with VisionAgent",
+                variant="primary"
+            )
+
+        with gr.Column():
+            output_report = gr.Markdown(
+                label="VisionAgent result and execution trace"
+            )
+
+    with gr.Row():
+        output_processed_image = gr.Image(
+            label="OpenCV enhanced image"
+        )
+        output_roi_image = gr.Image(
+            label="Extracted leaf ROI"
+        )
+        output_gradcam_image = gr.Image(
+            label="Grad-CAM++ explanation"
+        )
+
+    analyze_button.click(
+        fn=analyze_crop_image,
+        inputs=input_image,
+        outputs=[
+            output_report,
+            output_processed_image,
+            output_roi_image,
+            output_gradcam_image
+        ]
+    )
+
+
+print("\nLaunching DiseaseDetectPro VisionAgent web application...")
+demo.launch(share=True)
